@@ -15,8 +15,8 @@ use serde::ser::{self, Impossible, Serialize};
 /// A structure for serializing Rust values into JSON.
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub struct Serializer<W, F = CompactFormatter> {
-    writer: W,
-    formatter: F,
+    pub(crate) writer: W,
+    pub(crate) formatter: F,
 }
 
 impl<W> Serializer<W>
@@ -453,6 +453,99 @@ where
         }
         self.formatter
             .end_string(&mut self.writer)
+            .map_err(Error::io)
+    }
+}
+
+impl<W, F> Serializer<W, F>
+where
+    W: io::Write,
+    F: Formatter,
+{
+    /// Serialize a map key using JSON's key rules.
+    ///
+    /// This is the same logic used internally by `serialize_map`: keys must be
+    /// string-like scalars (strings, booleans, integers, finite floats, chars,
+    /// unit variants, newtype structs, `some`, or `collect_str`); anything
+    /// else is rejected with `key must be a string`.
+    pub(crate) fn serialize_map_key<T>(&mut self, key: &T) -> Result<()>
+    where
+        T: ?Sized + Serialize,
+    {
+        key.serialize(MapKeySerializer { ser: self })
+    }
+
+    pub(crate) fn begin_array(&mut self) -> Result<()> {
+        self.formatter
+            .begin_array(&mut self.writer)
+            .map_err(Error::io)
+    }
+
+    pub(crate) fn end_array(&mut self) -> Result<()> {
+        self.formatter
+            .end_array(&mut self.writer)
+            .map_err(Error::io)
+    }
+
+    pub(crate) fn begin_object(&mut self) -> Result<()> {
+        self.formatter
+            .begin_object(&mut self.writer)
+            .map_err(Error::io)
+    }
+
+    pub(crate) fn end_object(&mut self) -> Result<()> {
+        self.formatter
+            .end_object(&mut self.writer)
+            .map_err(Error::io)
+    }
+
+    pub(crate) fn begin_array_value(&mut self, first: bool) -> Result<()> {
+        self.formatter
+            .begin_array_value(&mut self.writer, first)
+            .map_err(Error::io)
+    }
+
+    pub(crate) fn end_array_value(&mut self) -> Result<()> {
+        self.formatter
+            .end_array_value(&mut self.writer)
+            .map_err(Error::io)
+    }
+
+    pub(crate) fn begin_object_key(&mut self, first: bool) -> Result<()> {
+        self.formatter
+            .begin_object_key(&mut self.writer, first)
+            .map_err(Error::io)
+    }
+
+    pub(crate) fn end_object_key(&mut self) -> Result<()> {
+        self.formatter
+            .end_object_key(&mut self.writer)
+            .map_err(Error::io)
+    }
+
+    pub(crate) fn begin_object_value(&mut self) -> Result<()> {
+        self.formatter
+            .begin_object_value(&mut self.writer)
+            .map_err(Error::io)
+    }
+
+    pub(crate) fn end_object_value(&mut self) -> Result<()> {
+        self.formatter
+            .end_object_value(&mut self.writer)
+            .map_err(Error::io)
+    }
+
+    #[cfg(feature = "arbitrary_precision")]
+    pub(crate) fn write_number_str(&mut self, value: &str) -> Result<()> {
+        self.formatter
+            .write_number_str(&mut self.writer, value)
+            .map_err(Error::io)
+    }
+
+    #[cfg(feature = "raw_value")]
+    pub(crate) fn write_raw_fragment(&mut self, value: &str) -> Result<()> {
+        self.formatter
+            .write_raw_fragment(&mut self.writer, value)
             .map_err(Error::io)
     }
 }

@@ -427,6 +427,8 @@ pub mod map;
 pub mod ser;
 #[cfg(not(feature = "std"))]
 mod ser;
+
+pub mod locator;
 pub mod value;
 
 mod io;
