@@ -402,6 +402,14 @@ pub use crate::ser::{to_string, to_string_pretty, to_vec, to_vec_pretty};
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 #[doc(inline)]
 pub use crate::ser::{to_writer, to_writer_pretty, Serializer};
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+#[doc(inline)]
+pub use crate::track::{
+    to_string_pretty_tracked, to_string_tracked, to_vec_pretty_tracked, to_vec_tracked,
+    to_writer_pretty_tracked, to_writer_tracked, PointerEntry, PointerIndex, PointerSerializer,
+    TrackedError,
+};
 #[doc(inline)]
 pub use crate::value::{from_value, to_value, Map, Number, Value};
 
@@ -428,6 +436,10 @@ pub mod ser;
 #[cfg(not(feature = "std"))]
 mod ser;
 pub mod value;
+
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub mod track;
 
 mod io;
 #[cfg(feature = "std")]
