@@ -421,6 +421,7 @@ mod macros;
 
 pub mod de;
 pub mod error;
+pub mod floathex;
 pub mod map;
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
