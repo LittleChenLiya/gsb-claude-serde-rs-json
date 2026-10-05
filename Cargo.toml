@@ -92,3 +92,9 @@ raw_value = []
 # overflow the stack after deserialization has completed, including, but not
 # limited to, Display and Debug and Drop impls.
 unbounded_depth = []
+
+# Enable an explicit borrow audit that records the paths and source ranges of
+# every `visit_borrowed_str`, copied string, and owned read during
+# deserialization. This is a diagnostic tool that does not change the behavior
+# or lifetime constraints of deserialization.
+borrow_audit = []

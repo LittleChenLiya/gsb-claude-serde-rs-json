@@ -429,6 +429,10 @@ pub mod ser;
 mod ser;
 pub mod value;
 
+#[cfg(feature = "borrow_audit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "borrow_audit")))]
+pub mod borrow_audit;
+
 mod io;
 #[cfg(feature = "std")]
 mod iter;

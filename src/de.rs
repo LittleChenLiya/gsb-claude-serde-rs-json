@@ -5,7 +5,13 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::lexical;
 use crate::number::Number;
 use crate::read::{self, Fused, Reference};
+#[cfg(feature = "borrow_audit")]
+use alloc::borrow::ToOwned;
+#[cfg(feature = "borrow_audit")]
+use alloc::format;
 use alloc::string::String;
+#[cfg(feature = "borrow_audit")]
+use alloc::string::ToString;
 use alloc::vec::Vec;
 #[cfg(feature = "float_roundtrip")]
 use core::iter;
@@ -18,6 +24,9 @@ use serde::forward_to_deserialize_any;
 
 #[cfg(feature = "arbitrary_precision")]
 use crate::number::NumberDeserializer;
+
+#[cfg(feature = "borrow_audit")]
+use crate::borrow_audit::{BorrowAudit, BorrowKind, PathSegment};
 
 pub use crate::read::{Read, SliceRead, StrRead};
 
@@ -36,6 +45,14 @@ pub struct Deserializer<R> {
     single_precision: bool,
     #[cfg(feature = "unbounded_depth")]
     disable_recursion_limit: bool,
+    #[cfg(feature = "borrow_audit")]
+    path: Vec<PathSegment>,
+    #[cfg(feature = "borrow_audit")]
+    audit: BorrowAudit,
+    #[cfg(feature = "borrow_audit")]
+    is_key: bool,
+    #[cfg(feature = "borrow_audit")]
+    pending_key: Option<String>,
 }
 
 impl<'de, R> Deserializer<R>
@@ -65,6 +82,14 @@ where
             single_precision: false,
             #[cfg(feature = "unbounded_depth")]
             disable_recursion_limit: false,
+            #[cfg(feature = "borrow_audit")]
+            path: Vec::new(),
+            #[cfg(feature = "borrow_audit")]
+            audit: BorrowAudit::new(),
+            #[cfg(feature = "borrow_audit")]
+            is_key: false,
+            #[cfg(feature = "borrow_audit")]
+            pending_key: None,
         }
     }
 }
@@ -216,6 +241,28 @@ impl<'de, R: Read<'de>> Deserializer<R> {
         self.disable_recursion_limit = true;
     }
 
+    /// Returns a reference to the borrow audit.
+    ///
+    /// The audit records the paths and source ranges of every
+    /// `visit_borrowed_str`, copied string, and owned read that occurred
+    /// during deserialization.
+    #[cfg(feature = "borrow_audit")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "borrow_audit")))]
+    pub fn borrow_audit(&self) -> &BorrowAudit {
+        &self.audit
+    }
+
+    /// Consumes the deserializer and returns the borrow audit.
+    ///
+    /// The audit records the paths and source ranges of every
+    /// `visit_borrowed_str`, copied string, and owned read that occurred
+    /// during deserialization.
+    #[cfg(feature = "borrow_audit")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "borrow_audit")))]
+    pub fn into_borrow_audit(self) -> BorrowAudit {
+        self.audit
+    }
+
     pub(crate) fn peek(&mut self) -> Result<Option<u8>> {
         self.read.peek()
     }
@@ -248,6 +295,46 @@ impl<'de, R: Read<'de>> Deserializer<R> {
     fn peek_error(&self, reason: ErrorCode) -> Error {
         let position = self.read.peek_position();
         Error::syntax(reason, position.line, position.column)
+    }
+
+    /// Parse a string and determine its borrow kind, without recording the
+    /// audit event.
+    ///
+    /// Returns the reference, the start offset, the end offset, and the kind.
+    #[cfg(feature = "borrow_audit")]
+    fn parse_str_for_audit<F>(
+        &mut self,
+        kind_fn: F,
+    ) -> Result<(Reference<'de, '_, str>, usize, usize, BorrowKind)>
+    where
+        F: FnOnce(&Reference<'de, '_, str>) -> BorrowKind,
+    {
+        let start = self.read.byte_offset();
+        self.eat_char();
+        self.scratch.clear();
+        let (reference, _start, end) = self.read.parse_str_audit(&mut self.scratch)?;
+        let kind = kind_fn(&reference);
+        Ok((reference, start, end, kind))
+    }
+
+    /// Parse a raw string and determine its borrow kind, without recording the
+    /// audit event.
+    ///
+    /// Returns the reference, the start offset, the end offset, and the kind.
+    #[cfg(feature = "borrow_audit")]
+    fn parse_str_raw_for_audit<F>(
+        &mut self,
+        kind_fn: F,
+    ) -> Result<(Reference<'de, '_, [u8]>, usize, usize, BorrowKind)>
+    where
+        F: FnOnce(&Reference<'de, '_, [u8]>) -> BorrowKind,
+    {
+        let start = self.read.byte_offset();
+        self.eat_char();
+        self.scratch.clear();
+        let (reference, _start, end) = self.read.parse_str_raw_audit(&mut self.scratch)?;
+        let kind = kind_fn(&reference);
+        Ok((reference, start, end, kind))
     }
 
     /// Returns the first non-whitespace byte without consuming it, or `None` if
@@ -1386,6 +1473,53 @@ macro_rules! check_recursion {
     };
 }
 
+//////////////////////////////////////////////////////////////////////////////
+// Borrow audit path tracking (does not require Read trait bound).
+
+#[cfg(feature = "borrow_audit")]
+impl<R> Deserializer<R> {
+    /// Push a map key onto the path.
+    fn push_key(&mut self, key: &str) {
+        self.path.push(PathSegment::Key(key.to_owned()));
+    }
+
+    /// Pop a map key from the path.
+    fn pop_key(&mut self) {
+        self.path.pop();
+    }
+
+    /// Push an array index onto the path.
+    fn push_index(&mut self, index: usize) {
+        self.path.push(PathSegment::Index(index));
+    }
+
+    /// Pop an array index from the path.
+    fn pop_index(&mut self) {
+        self.path.pop();
+    }
+
+    /// Format the current path as a string.
+    fn path_string(&self) -> String {
+        let mut s = String::new();
+        for (i, segment) in self.path.iter().enumerate() {
+            match segment {
+                PathSegment::Key(k) => {
+                    if i > 0 {
+                        s.push('.');
+                    }
+                    s.push_str(k);
+                }
+                PathSegment::Index(idx) => {
+                    s.push('[');
+                    s.push_str(&idx.to_string());
+                    s.push(']');
+                }
+            }
+        }
+        s
+    }
+}
+
 impl<'de, R: Read<'de>> de::Deserializer<'de> for &mut Deserializer<R> {
     type Error = Error;
 
@@ -1423,11 +1557,57 @@ impl<'de, R: Read<'de>> de::Deserializer<'de> for &mut Deserializer<R> {
             }
             b'0'..=b'9' => tri!(self.parse_any_number(true)).visit(visitor),
             b'"' => {
-                self.eat_char();
-                self.scratch.clear();
-                match tri!(self.read.parse_str(&mut self.scratch)) {
-                    Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
-                    Reference::Copied(s) => visitor.visit_str(s),
+                #[cfg(feature = "borrow_audit")]
+                {
+                    let is_reader = self.read.is_reader();
+                    let (reference, start, end, kind) = tri!(self.parse_str_for_audit(
+                        |reference| match reference {
+                            Reference::Borrowed(_) => BorrowKind::Borrowed,
+                            Reference::Copied(_) => {
+                                if is_reader {
+                                    BorrowKind::Owned
+                                } else {
+                                    BorrowKind::Copied
+                                }
+                            }
+                        },
+                    ));
+                    // Match on the reference first to avoid borrow conflicts.
+                    // For Borrowed, the reference has lifetime 'de (independent
+                    // of self), so we can record the event without conflicts.
+                    // For Copied, we extract the string first.
+                    match &reference {
+                        Reference::Borrowed(s) => {
+                            self.audit.record(
+                                self.path_string(),
+                                start,
+                                end,
+                                kind,
+                                self.is_key,
+                            );
+                            visitor.visit_borrowed_str(s)
+                        }
+                        Reference::Copied(s) => {
+                            let s = (*s).to_owned();
+                            self.audit.record(
+                                self.path_string(),
+                                start,
+                                end,
+                                kind,
+                                self.is_key,
+                            );
+                            visitor.visit_str(&s)
+                        }
+                    }
+                }
+                #[cfg(not(feature = "borrow_audit"))]
+                {
+                    self.eat_char();
+                    self.scratch.clear();
+                    match tri!(self.read.parse_str(&mut self.scratch)) {
+                        Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
+                        Reference::Copied(s) => visitor.visit_str(s),
+                    }
                 }
             }
             b'[' => {
@@ -1534,11 +1714,53 @@ impl<'de, R: Read<'de>> de::Deserializer<'de> for &mut Deserializer<R> {
 
         let value = match peek {
             b'"' => {
-                self.eat_char();
-                self.scratch.clear();
-                match tri!(self.read.parse_str(&mut self.scratch)) {
-                    Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
-                    Reference::Copied(s) => visitor.visit_str(s),
+                #[cfg(feature = "borrow_audit")]
+                {
+                    let is_reader = self.read.is_reader();
+                    let (reference, start, end, kind) = tri!(self.parse_str_for_audit(
+                        |reference| match reference {
+                            Reference::Borrowed(_) => BorrowKind::Borrowed,
+                            Reference::Copied(_) => {
+                                if is_reader {
+                                    BorrowKind::Owned
+                                } else {
+                                    BorrowKind::Copied
+                                }
+                            }
+                        },
+                    ));
+                    match &reference {
+                        Reference::Borrowed(s) => {
+                            self.audit.record(
+                                self.path_string(),
+                                start,
+                                end,
+                                kind,
+                                self.is_key,
+                            );
+                            visitor.visit_borrowed_str(s)
+                        }
+                        Reference::Copied(s) => {
+                            let s = (*s).to_owned();
+                            self.audit.record(
+                                self.path_string(),
+                                start,
+                                end,
+                                kind,
+                                self.is_key,
+                            );
+                            visitor.visit_str(&s)
+                        }
+                    }
+                }
+                #[cfg(not(feature = "borrow_audit"))]
+                {
+                    self.eat_char();
+                    self.scratch.clear();
+                    match tri!(self.read.parse_str(&mut self.scratch)) {
+                        Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
+                        Reference::Copied(s) => visitor.visit_str(s),
+                    }
                 }
             }
             _ => Err(self.peek_invalid_type(&visitor)),
@@ -1643,11 +1865,53 @@ impl<'de, R: Read<'de>> de::Deserializer<'de> for &mut Deserializer<R> {
 
         let value = match peek {
             b'"' => {
-                self.eat_char();
-                self.scratch.clear();
-                match tri!(self.read.parse_str_raw(&mut self.scratch)) {
-                    Reference::Borrowed(b) => visitor.visit_borrowed_bytes(b),
-                    Reference::Copied(b) => visitor.visit_bytes(b),
+                #[cfg(feature = "borrow_audit")]
+                {
+                    let is_reader = self.read.is_reader();
+                    let (reference, start, end, kind) = tri!(self.parse_str_raw_for_audit(
+                        |reference| match reference {
+                            Reference::Borrowed(_) => BorrowKind::Borrowed,
+                            Reference::Copied(_) => {
+                                if is_reader {
+                                    BorrowKind::Owned
+                                } else {
+                                    BorrowKind::Copied
+                                }
+                            }
+                        },
+                    ));
+                    match &reference {
+                        Reference::Borrowed(b) => {
+                            self.audit.record(
+                                self.path_string(),
+                                start,
+                                end,
+                                kind,
+                                self.is_key,
+                            );
+                            visitor.visit_borrowed_bytes(b)
+                        }
+                        Reference::Copied(b) => {
+                            let b = (*b).to_owned();
+                            self.audit.record(
+                                self.path_string(),
+                                start,
+                                end,
+                                kind,
+                                self.is_key,
+                            );
+                            visitor.visit_bytes(&b)
+                        }
+                    }
+                }
+                #[cfg(not(feature = "borrow_audit"))]
+                {
+                    self.eat_char();
+                    self.scratch.clear();
+                    match tri!(self.read.parse_str_raw(&mut self.scratch)) {
+                        Reference::Borrowed(b) => visitor.visit_borrowed_bytes(b),
+                        Reference::Copied(b) => visitor.visit_bytes(b),
+                    }
                 }
             }
             b'[' => self.deserialize_seq(visitor),
@@ -1919,11 +2183,18 @@ impl<'de, R: Read<'de>> de::Deserializer<'de> for &mut Deserializer<R> {
 struct SeqAccess<'a, R: 'a> {
     de: &'a mut Deserializer<R>,
     first: bool,
+    #[cfg(feature = "borrow_audit")]
+    index: usize,
 }
 
 impl<'a, R: 'a> SeqAccess<'a, R> {
     fn new(de: &'a mut Deserializer<R>) -> Self {
-        SeqAccess { de, first: true }
+        SeqAccess {
+            de,
+            first: true,
+            #[cfg(feature = "borrow_audit")]
+            index: 0,
+        }
     }
 }
 
@@ -1962,7 +2233,17 @@ impl<'de, 'a, R: Read<'de> + 'a> de::SeqAccess<'de> for SeqAccess<'a, R> {
         }
 
         if tri!(has_next_element(self)) {
-            Ok(Some(tri!(seed.deserialize(&mut *self.de))))
+            #[cfg(feature = "borrow_audit")]
+            {
+                self.de.push_index(self.index);
+                self.index += 1;
+            }
+            let value = tri!(seed.deserialize(&mut *self.de));
+            #[cfg(feature = "borrow_audit")]
+            {
+                self.de.pop_index();
+            }
+            Ok(Some(value))
         } else {
             Ok(None)
         }
@@ -1972,11 +2253,18 @@ impl<'de, 'a, R: Read<'de> + 'a> de::SeqAccess<'de> for SeqAccess<'a, R> {
 struct MapAccess<'a, R: 'a> {
     de: &'a mut Deserializer<R>,
     first: bool,
+    #[cfg(feature = "borrow_audit")]
+    has_key: bool,
 }
 
 impl<'a, R: 'a> MapAccess<'a, R> {
     fn new(de: &'a mut Deserializer<R>) -> Self {
-        MapAccess { de, first: true }
+        MapAccess {
+            de,
+            first: true,
+            #[cfg(feature = "borrow_audit")]
+            has_key: false,
+        }
     }
 }
 
@@ -2018,7 +2306,27 @@ impl<'de, 'a, R: Read<'de> + 'a> de::MapAccess<'de> for MapAccess<'a, R> {
         }
 
         if tri!(has_next_key(self)) {
-            Ok(Some(tri!(seed.deserialize(MapKey { de: &mut *self.de }))))
+            #[cfg(feature = "borrow_audit")]
+            {
+                // Pop the previous key before deserializing the next one.
+                if self.has_key {
+                    self.de.pop_key();
+                }
+                self.de.is_key = true;
+            }
+            let key = tri!(seed.deserialize(MapKey { de: &mut *self.de }));
+            #[cfg(feature = "borrow_audit")]
+            {
+                self.de.is_key = false;
+                // Push the key string onto the path. If the key was not a
+                // string (e.g. numeric or bool), use a placeholder.
+                match self.de.pending_key.take() {
+                    Some(k) => self.de.push_key(&k),
+                    None => self.de.push_key("?"),
+                }
+                self.has_key = true;
+            }
+            Ok(Some(key))
         } else {
             Ok(None)
         }
@@ -2031,6 +2339,17 @@ impl<'de, 'a, R: Read<'de> + 'a> de::MapAccess<'de> for MapAccess<'a, R> {
         tri!(self.de.parse_object_colon());
 
         seed.deserialize(&mut *self.de)
+    }
+}
+
+#[cfg(feature = "borrow_audit")]
+impl<'a, R: 'a> Drop for MapAccess<'a, R> {
+    fn drop(&mut self) {
+        // Pop the last key when the map access is dropped, so that the path
+        // returns to its state before the map was entered.
+        if self.has_key {
+            self.de.pop_key();
+        }
     }
 }
 
@@ -2216,11 +2535,62 @@ where
     where
         V: de::Visitor<'de>,
     {
-        self.de.eat_char();
-        self.de.scratch.clear();
-        match tri!(self.de.read.parse_str(&mut self.de.scratch)) {
-            Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
-            Reference::Copied(s) => visitor.visit_str(s),
+        #[cfg(feature = "borrow_audit")]
+        {
+            let is_reader = self.de.read.is_reader();
+            // Compute the current path before parsing, since parsing borrows
+            // self.de mutably.
+            let current_path = self.de.path_string();
+            // Create a raw pointer to the audit before the mutable borrow, to
+            // avoid borrow conflicts when recording the event.
+            let audit_ptr = &mut self.de.audit as *mut BorrowAudit;
+            let (reference, start, end, kind) = tri!(self.de.parse_str_for_audit(
+                |reference| match reference {
+                    Reference::Borrowed(_) => BorrowKind::Borrowed,
+                    Reference::Copied(_) => {
+                        if is_reader {
+                            BorrowKind::Owned
+                        } else {
+                            BorrowKind::Copied
+                        }
+                    }
+                },
+            ));
+            // Extract the key string before visiting, so we can store it in
+            // pending_key after the visit without borrow conflicts.
+            let key_str = match &reference {
+                Reference::Borrowed(s) => (*s).to_owned(),
+                Reference::Copied(s) => (*s).to_owned(),
+            };
+            // Compute the key's path (current path + key) and record the audit
+            // event with it. The key is not yet pushed onto the path at this
+            // point, so we compute the path manually.
+            let key_path = if current_path.is_empty() {
+                key_str.clone()
+            } else {
+                format!("{}.{}", current_path, key_str)
+            };
+            // Record the event through the raw pointer to avoid borrow
+            // conflicts with the reference, which borrows from self.de.read
+            // and self.de.scratch.
+            unsafe {
+                (*audit_ptr).record(key_path, start, end, kind, true);
+            }
+            let result = match reference {
+                Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
+                Reference::Copied(_) => visitor.visit_str(&key_str),
+            };
+            self.de.pending_key = Some(key_str);
+            result
+        }
+        #[cfg(not(feature = "borrow_audit"))]
+        {
+            self.de.eat_char();
+            self.de.scratch.clear();
+            match tri!(self.de.read.parse_str(&mut self.de.scratch)) {
+                Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
+                Reference::Copied(s) => visitor.visit_str(s),
+            }
         }
     }
 

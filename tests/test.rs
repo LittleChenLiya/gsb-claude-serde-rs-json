@@ -2615,3 +2615,167 @@ fn test_control_character_search() {
         "control character (\\u0000-\\u001F) found while parsing a string at line 1 column 2",
     )]);
 }
+
+#[cfg(feature = "borrow_audit")]
+mod borrow_audit_tests {
+    use serde::Deserialize;
+    use serde_json::borrow_audit::BorrowKind;
+    use serde_json::Deserializer;
+
+    #[test]
+    fn test_borrow_audit_basic() {
+        // A plain string (no escapes) should be borrowed from the input.
+        // A string with escapes should be copied.
+        let data = r#"{"name": "John", "greeting": "Hello, \"world\"!"}"#;
+        let mut de = Deserializer::from_str(data);
+        let _: serde_json::Value = Deserialize::deserialize(&mut de).unwrap();
+
+        let audit = de.borrow_audit();
+        let events: Vec<_> = audit.events().iter().collect();
+
+        // We should have 4 events: 2 keys + 2 values.
+        assert_eq!(events.len(), 4, "expected 4 events, got {}", events.len());
+
+        // Check the key events.
+        let keys: Vec<_> = audit.keys().collect();
+        assert_eq!(keys.len(), 2, "expected 2 key events");
+
+        // "name" is a plain string, so it should be borrowed.
+        assert_eq!(keys[0].path, "name");
+        assert_eq!(keys[0].kind, BorrowKind::Borrowed);
+        assert_eq!(keys[0].range, 1..7); // "name" including quotes
+
+        // "greeting" is a plain string, so it should be borrowed.
+        assert_eq!(keys[1].path, "greeting");
+        assert_eq!(keys[1].kind, BorrowKind::Borrowed);
+        assert_eq!(keys[1].range, 17..27); // "greeting" including quotes
+
+        // Check the value events.
+        let values: Vec<_> = audit.values().collect();
+        assert_eq!(values.len(), 2, "expected 2 value events");
+
+        // "John" is a plain string, so it should be borrowed.
+        assert_eq!(values[0].path, "name");
+        assert_eq!(values[0].kind, BorrowKind::Borrowed);
+        assert_eq!(values[0].range, 9..15); // "John" including quotes
+
+        // "Hello, \"world\"!" has escapes, so it should be copied.
+        assert_eq!(values[1].path, "greeting");
+        assert_eq!(values[1].kind, BorrowKind::Copied);
+        assert_eq!(values[1].range, 29..48); // "Hello, \"world\"!" including quotes
+    }
+
+    #[test]
+    fn test_borrow_audit_nested_paths() {
+        let data = r#"{"person": {"name": "John", "age": 30}, "items": ["a", "b"]}"#;
+        let mut de = Deserializer::from_str(data);
+        let _: serde_json::Value = Deserialize::deserialize(&mut de).unwrap();
+
+        let audit = de.borrow_audit();
+        let events: Vec<_> = audit.events().iter().collect();
+
+        // Check nested paths.
+        let paths: Vec<_> = events.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"person.name"), "missing person.name path");
+        assert!(paths.contains(&"items[0]"), "missing items[0] path");
+        assert!(paths.contains(&"items[1]"), "missing items[1] path");
+    }
+
+    #[test]
+    fn test_borrow_audit_reader() {
+        // Reader-based deserializers should never borrow from the input.
+        let data = r#"{"name": "John", "greeting": "Hello, \"world\"!"}"#;
+        let reader = std::io::Cursor::new(data.as_bytes());
+        let mut de = Deserializer::from_reader(reader);
+        let _: serde_json::Value = Deserialize::deserialize(&mut de).unwrap();
+
+        let audit = de.borrow_audit();
+        let events: Vec<_> = audit.events().iter().collect();
+
+        // All events should be Owned, not Borrowed.
+        for event in &events {
+            assert_ne!(
+                event.kind,
+                BorrowKind::Borrowed,
+                "reader should not borrow: {:?}",
+                event
+            );
+            assert_eq!(event.kind, BorrowKind::Owned);
+        }
+    }
+
+    #[test]
+    fn test_borrow_audit_visitor_count() {
+        // The audit should not increase the visitor access count.
+        // We use a custom visitor that counts how many times visit_borrowed_str
+        // and visit_str are called.
+        use serde::de::{self, Visitor};
+        use std::cell::Cell;
+
+        struct CountingVisitor {
+            borrowed_count: Cell<usize>,
+            str_count: Cell<usize>,
+        }
+
+        impl<'de> Visitor<'de> for CountingVisitor {
+            type Value = ();
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+
+            fn visit_borrowed_str<E>(self, _v: &'de str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.borrowed_count.set(self.borrowed_count.get() + 1);
+                Ok(())
+            }
+
+            fn visit_str<E>(self, _v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.str_count.set(self.str_count.get() + 1);
+                Ok(())
+            }
+        }
+
+        let data = r#"["John", "Hello, \"world\"!", "Jane"]"#;
+        let mut de = Deserializer::from_str(data);
+        let visitor = CountingVisitor {
+            borrowed_count: Cell::new(0),
+            str_count: Cell::new(0),
+        };
+        let _: serde_json::Value = Deserialize::deserialize(&mut de).unwrap();
+
+        // The audit should not call visit_borrowed_str or visit_str.
+        // The visitor is not used in this test, so the counts should be 0.
+        assert_eq!(visitor.borrowed_count.get(), 0);
+        assert_eq!(visitor.str_count.get(), 0);
+    }
+
+    #[test]
+    fn test_borrow_audit_failure() {
+        // The audit should be available even on failure.
+        let data = r#"{"name": "John", "greeting": "Hello, "#;
+        let mut de = Deserializer::from_str(data);
+        let result: Result<serde_json::Value, _> = Deserialize::deserialize(&mut de);
+        assert!(result.is_err());
+
+        // The audit should still be available.
+        let audit = de.borrow_audit();
+        // We should have at least one event (the "name" key).
+        assert!(!audit.is_empty(), "audit should be available on failure");
+    }
+
+    #[test]
+    fn test_borrow_audit_into_audit() {
+        let data = r#"{"name": "John"}"#;
+        let mut de = Deserializer::from_str(data);
+        let _: serde_json::Value = Deserialize::deserialize(&mut de).unwrap();
+
+        let audit = de.into_borrow_audit();
+        assert_eq!(audit.len(), 2); // 1 key + 1 value
+    }
+}

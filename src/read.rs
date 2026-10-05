@@ -60,6 +60,40 @@ pub trait Read<'de>: private::Sealed {
     #[doc(hidden)]
     fn byte_offset(&self) -> usize;
 
+    /// Whether this reader is a `std::io::Read` source.
+    ///
+    /// Reader-based deserializers never borrow from the input because the
+    /// `std::io::Read` trait has no non-copying methods.
+    #[cfg(feature = "borrow_audit")]
+    #[doc(hidden)]
+    fn is_reader(&self) -> bool {
+        false
+    }
+
+    /// Parse a JSON-escaped string and return the reference, the start offset,
+    /// and the end offset.
+    ///
+    /// This is used by the borrow audit to record the source range of the
+    /// string.
+    #[cfg(feature = "borrow_audit")]
+    #[doc(hidden)]
+    fn parse_str_audit<'s>(
+        &'s mut self,
+        scratch: &'s mut Vec<u8>,
+    ) -> Result<(Reference<'de, 's, str>, usize, usize)>;
+
+    /// Parse a raw JSON-escaped string and return the reference, the start
+    /// offset, and the end offset.
+    ///
+    /// This is used by the borrow audit to record the source range of the
+    /// string.
+    #[cfg(feature = "borrow_audit")]
+    #[doc(hidden)]
+    fn parse_str_raw_audit<'s>(
+        &'s mut self,
+        scratch: &'s mut Vec<u8>,
+    ) -> Result<(Reference<'de, 's, [u8]>, usize, usize)>;
+
     /// Assumes the previous byte was a quotation mark. Parses a JSON-escaped
     /// string until the next quotation mark using the given scratch space if
     /// necessary. The scratch space is initially empty.
@@ -332,6 +366,11 @@ where
         }
     }
 
+    #[cfg(feature = "borrow_audit")]
+    fn is_reader(&self) -> bool {
+        true
+    }
+
     fn parse_str<'s>(&'s mut self, scratch: &'s mut Vec<u8>) -> Result<Reference<'de, 's, str>> {
         self.parse_str_bytes(scratch, true, as_str)
             .map(Reference::Copied)
@@ -343,6 +382,37 @@ where
     ) -> Result<Reference<'de, 's, [u8]>> {
         self.parse_str_bytes(scratch, false, |_, bytes| Ok(bytes))
             .map(Reference::Copied)
+    }
+
+    #[cfg(feature = "borrow_audit")]
+    fn parse_str_audit<'s>(
+        &'s mut self,
+        scratch: &'s mut Vec<u8>,
+    ) -> Result<(Reference<'de, 's, str>, usize, usize)> {
+        let start = self.byte_offset();
+        let self_ptr = self as *const Self;
+        let reference = self.parse_str_bytes(scratch, true, as_str).map(Reference::Copied)?;
+        // SAFETY: The raw pointer was created before the mutable borrow, and
+        // byte_offset() does not mutate self. The Reference::Copied variant
+        // borrows from scratch, not from self, so it is safe to call
+        // byte_offset() while the reference is alive.
+        let end = unsafe { (*self_ptr).byte_offset() };
+        Ok((reference, start, end))
+    }
+
+    #[cfg(feature = "borrow_audit")]
+    fn parse_str_raw_audit<'s>(
+        &'s mut self,
+        scratch: &'s mut Vec<u8>,
+    ) -> Result<(Reference<'de, 's, [u8]>, usize, usize)> {
+        let start = self.byte_offset();
+        let self_ptr = self as *const Self;
+        let reference = self
+            .parse_str_bytes(scratch, false, |_, bytes| Ok(bytes))
+            .map(Reference::Copied)?;
+        // SAFETY: See parse_str_audit above.
+        let end = unsafe { (*self_ptr).byte_offset() };
+        Ok((reference, start, end))
     }
 
     fn ignore_str(&mut self) -> Result<()> {
@@ -595,6 +665,33 @@ impl<'a> Read<'a> for SliceRead<'a> {
         self.parse_str_bytes(scratch, false, |_, bytes| Ok(bytes))
     }
 
+    #[cfg(feature = "borrow_audit")]
+    fn parse_str_audit<'s>(
+        &'s mut self,
+        scratch: &'s mut Vec<u8>,
+    ) -> Result<(Reference<'a, 's, str>, usize, usize)> {
+        let start = self.index;
+        let self_ptr = self as *const Self;
+        let reference = self.parse_str_bytes(scratch, true, as_str)?;
+        // SAFETY: The raw pointer was created before the mutable borrow, and
+        // we're just reading a usize value through it, not holding a reference.
+        let end = unsafe { (*self_ptr).index };
+        Ok((reference, start, end))
+    }
+
+    #[cfg(feature = "borrow_audit")]
+    fn parse_str_raw_audit<'s>(
+        &'s mut self,
+        scratch: &'s mut Vec<u8>,
+    ) -> Result<(Reference<'a, 's, [u8]>, usize, usize)> {
+        let start = self.index;
+        let self_ptr = self as *const Self;
+        let reference = self.parse_str_bytes(scratch, false, |_, bytes| Ok(bytes))?;
+        // SAFETY: See parse_str_audit above.
+        let end = unsafe { (*self_ptr).index };
+        Ok((reference, start, end))
+    }
+
     fn ignore_str(&mut self) -> Result<()> {
         loop {
             self.skip_to_escape(true);
@@ -722,6 +819,35 @@ impl<'a> Read<'a> for StrRead<'a> {
         self.delegate.parse_str_raw(scratch)
     }
 
+    #[cfg(feature = "borrow_audit")]
+    fn parse_str_audit<'s>(
+        &'s mut self,
+        scratch: &'s mut Vec<u8>,
+    ) -> Result<(Reference<'a, 's, str>, usize, usize)> {
+        let start = self.delegate.index;
+        let self_ptr = self as *const Self;
+        let reference = self.delegate.parse_str_bytes(scratch, true, |_, bytes| {
+            Ok(unsafe { str::from_utf8_unchecked(bytes) })
+        })?;
+        // SAFETY: The raw pointer was created before the mutable borrow, and
+        // we're just reading a usize value through it, not holding a reference.
+        let end = unsafe { (*self_ptr).delegate.index };
+        Ok((reference, start, end))
+    }
+
+    #[cfg(feature = "borrow_audit")]
+    fn parse_str_raw_audit<'s>(
+        &'s mut self,
+        scratch: &'s mut Vec<u8>,
+    ) -> Result<(Reference<'a, 's, [u8]>, usize, usize)> {
+        let start = self.delegate.index;
+        let self_ptr = self as *const Self;
+        let reference = self.delegate.parse_str_raw(scratch)?;
+        // SAFETY: See parse_str_audit above.
+        let end = unsafe { (*self_ptr).delegate.index };
+        Ok((reference, start, end))
+    }
+
     fn ignore_str(&mut self) -> Result<()> {
         self.delegate.ignore_str()
     }
@@ -796,6 +922,22 @@ where
         scratch: &'s mut Vec<u8>,
     ) -> Result<Reference<'de, 's, [u8]>> {
         R::parse_str_raw(self, scratch)
+    }
+
+    #[cfg(feature = "borrow_audit")]
+    fn parse_str_audit<'s>(
+        &'s mut self,
+        scratch: &'s mut Vec<u8>,
+    ) -> Result<(Reference<'de, 's, str>, usize, usize)> {
+        R::parse_str_audit(self, scratch)
+    }
+
+    #[cfg(feature = "borrow_audit")]
+    fn parse_str_raw_audit<'s>(
+        &'s mut self,
+        scratch: &'s mut Vec<u8>,
+    ) -> Result<(Reference<'de, 's, [u8]>, usize, usize)> {
+        R::parse_str_raw_audit(self, scratch)
     }
 
     fn ignore_str(&mut self) -> Result<()> {

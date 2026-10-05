@@ -1,0 +1,11 @@
+# Cargo aliases for serde_json development.
+#
+# Run the borrow audit example with:
+#   cargo borrow-audit
+#
+# Run the borrow audit tests with:
+#   cargo test-borrow-audit
+
+[alias]
+borrow-audit = "run --example borrow_audit --features borrow_audit"
+test-borrow-audit = "test --features borrow_audit borrow_audit_tests"
