@@ -198,6 +198,27 @@ impl Number {
         }
     }
 
+    /// Creates a `Number` from an `f64` value, including non-finite values such
+    /// as `NaN` and infinity. This is used by the float hex protocol adapter to
+    /// preserve exact bit patterns.
+    #[cfg(not(feature = "arbitrary_precision"))]
+    pub(crate) fn from_f64_bits(f: f64) -> Number {
+        Number { n: N::Float(f) }
+    }
+
+    /// Creates a `Number` from an `f64` value, including non-finite values such
+    /// as `NaN` and infinity. This is used by the float hex protocol adapter to
+    /// preserve exact bit patterns.
+    #[cfg(feature = "arbitrary_precision")]
+    pub(crate) fn from_f64_bits(f: f64) -> Number {
+        let n = if f.is_finite() {
+            zmij::Buffer::new().format_finite(f).to_owned()
+        } else {
+            f.to_string()
+        };
+        Number { n }
+    }
+
     /// If the `Number` is an integer, represent it as i128 if possible. Returns
     /// None otherwise.
     pub fn as_i128(&self) -> Option<i128> {
