@@ -1,5 +1,6 @@
 //! Deserialize JSON data to a Rust data structure.
 
+use crate::audit::{self, BorrowAudit, InputSource};
 use crate::error::{Error, ErrorCode, Result};
 #[cfg(feature = "float_roundtrip")]
 use crate::lexical;
@@ -36,6 +37,8 @@ pub struct Deserializer<R> {
     single_precision: bool,
     #[cfg(feature = "unbounded_depth")]
     disable_recursion_limit: bool,
+    input_source: InputSource,
+    audit: Option<BorrowAudit>,
 }
 
 impl<'de, R> Deserializer<R>
@@ -65,6 +68,56 @@ where
             single_precision: false,
             #[cfg(feature = "unbounded_depth")]
             disable_recursion_limit: false,
+            input_source: InputSource::Custom,
+            audit: None,
+        }
+    }
+
+    /// Enable an explicit audit of string borrowing for the next
+    /// deserialization pass on this deserializer.
+    ///
+    /// While enabled, every JSON string the parser reads is recorded in a
+    /// [`BorrowAudit`] with its actual delivery kind (`visit_borrowed_str`
+    /// vs `visit_str`), its JSON path, whether it was a map key or a value,
+    /// and its byte range in the input. The audit observes the single real
+    /// deserialization pass: `Deserialize` is not re-run, the visitor is
+    /// not wrapped (so visitor call counts are unchanged), and parse
+    /// results and lifetime constraints are unaffected. If deserialization
+    /// fails, the audit is incomplete and only covers the strings parsed
+    /// before the failure.
+    ///
+    /// See the [`audit`][crate::audit] module for examples.
+    pub fn enable_borrow_audit(&mut self) -> &mut Self {
+        self.audit = Some(BorrowAudit::new(self.input_source));
+        self
+    }
+
+    /// The audit recorded so far, if [`enable_borrow_audit`][Self::enable_borrow_audit]
+    /// was called.
+    pub fn borrow_audit(&self) -> Option<&BorrowAudit> {
+        self.audit.as_ref()
+    }
+
+    /// Take the recorded audit out of the deserializer, leaving auditing
+    /// disabled.
+    pub fn take_borrow_audit(&mut self) -> Option<BorrowAudit> {
+        self.audit.take()
+    }
+
+    #[inline]
+    fn audit_mark(&self) -> Option<usize> {
+        if self.audit.is_some() {
+            Some(self.read.byte_offset())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn audit_commit(&mut self, mark: Option<usize>) {
+        if let Some(start) = mark {
+            let end = self.read.byte_offset();
+            audit::commit(&mut self.audit, start, end);
         }
     }
 }
@@ -80,21 +133,27 @@ where
     /// like `&str`, since the `std::io::Read` trait has no non-copying methods
     /// -- everything it does involves copying bytes out of the data source.
     pub fn from_reader(reader: R) -> Self {
-        Deserializer::new(read::IoRead::new(reader))
+        let mut de = Deserializer::new(read::IoRead::new(reader));
+        de.input_source = InputSource::Reader;
+        de
     }
 }
 
 impl<'a> Deserializer<read::SliceRead<'a>> {
     /// Creates a JSON deserializer from a `&[u8]`.
     pub fn from_slice(bytes: &'a [u8]) -> Self {
-        Deserializer::new(read::SliceRead::new(bytes))
+        let mut de = Deserializer::new(read::SliceRead::new(bytes));
+        de.input_source = InputSource::Slice;
+        de
     }
 }
 
 impl<'a> Deserializer<read::StrRead<'a>> {
     /// Creates a JSON deserializer from a `&str`.
     pub fn from_str(s: &'a str) -> Self {
-        Deserializer::new(read::StrRead::new(s))
+        let mut de = Deserializer::new(read::StrRead::new(s));
+        de.input_source = InputSource::Str;
+        de
     }
 }
 
@@ -1423,12 +1482,17 @@ impl<'de, R: Read<'de>> de::Deserializer<'de> for &mut Deserializer<R> {
             }
             b'0'..=b'9' => tri!(self.parse_any_number(true)).visit(visitor),
             b'"' => {
+                let audit_mark = self.audit_mark();
                 self.eat_char();
                 self.scratch.clear();
-                match tri!(self.read.parse_str(&mut self.scratch)) {
+                let reference = tri!(self.read.parse_str(&mut self.scratch));
+                audit::note_str(&mut self.audit, &reference);
+                let value = match reference {
                     Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
                     Reference::Copied(s) => visitor.visit_str(s),
-                }
+                };
+                self.audit_commit(audit_mark);
+                value
             }
             b'[' => {
                 check_recursion! {
@@ -1534,12 +1598,17 @@ impl<'de, R: Read<'de>> de::Deserializer<'de> for &mut Deserializer<R> {
 
         let value = match peek {
             b'"' => {
+                let audit_mark = self.audit_mark();
                 self.eat_char();
                 self.scratch.clear();
-                match tri!(self.read.parse_str(&mut self.scratch)) {
+                let reference = tri!(self.read.parse_str(&mut self.scratch));
+                audit::note_str(&mut self.audit, &reference);
+                let value = match reference {
                     Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
                     Reference::Copied(s) => visitor.visit_str(s),
-                }
+                };
+                self.audit_commit(audit_mark);
+                value
             }
             _ => Err(self.peek_invalid_type(&visitor)),
         };
@@ -1643,12 +1712,17 @@ impl<'de, R: Read<'de>> de::Deserializer<'de> for &mut Deserializer<R> {
 
         let value = match peek {
             b'"' => {
+                let audit_mark = self.audit_mark();
                 self.eat_char();
                 self.scratch.clear();
-                match tri!(self.read.parse_str_raw(&mut self.scratch)) {
+                let reference = tri!(self.read.parse_str_raw(&mut self.scratch));
+                audit::note_bytes(&mut self.audit, &reference);
+                let value = match reference {
                     Reference::Borrowed(b) => visitor.visit_borrowed_bytes(b),
                     Reference::Copied(b) => visitor.visit_bytes(b),
-                }
+                };
+                self.audit_commit(audit_mark);
+                value
             }
             b'[' => self.deserialize_seq(visitor),
             _ => Err(self.peek_invalid_type(&visitor)),
@@ -1919,11 +1993,16 @@ impl<'de, R: Read<'de>> de::Deserializer<'de> for &mut Deserializer<R> {
 struct SeqAccess<'a, R: 'a> {
     de: &'a mut Deserializer<R>,
     first: bool,
+    index: usize,
 }
 
 impl<'a, R: 'a> SeqAccess<'a, R> {
     fn new(de: &'a mut Deserializer<R>) -> Self {
-        SeqAccess { de, first: true }
+        SeqAccess {
+            de,
+            first: true,
+            index: 0,
+        }
     }
 }
 
@@ -1962,7 +2041,11 @@ impl<'de, 'a, R: Read<'de> + 'a> de::SeqAccess<'de> for SeqAccess<'a, R> {
         }
 
         if tri!(has_next_element(self)) {
-            Ok(Some(tri!(seed.deserialize(&mut *self.de))))
+            audit::begin_index(&mut self.de.audit, self.index);
+            let element = seed.deserialize(&mut *self.de);
+            audit::end_container_child(&mut self.de.audit);
+            self.index += 1;
+            Ok(Some(tri!(element)))
         } else {
             Ok(None)
         }
@@ -2018,7 +2101,10 @@ impl<'de, 'a, R: Read<'de> + 'a> de::MapAccess<'de> for MapAccess<'a, R> {
         }
 
         if tri!(has_next_key(self)) {
-            Ok(Some(tri!(seed.deserialize(MapKey { de: &mut *self.de }))))
+            audit::begin_key(&mut self.de.audit);
+            let key = seed.deserialize(MapKey { de: &mut *self.de });
+            audit::end_key(&mut self.de.audit);
+            Ok(Some(tri!(key)))
         } else {
             Ok(None)
         }
@@ -2030,7 +2116,9 @@ impl<'de, 'a, R: Read<'de> + 'a> de::MapAccess<'de> for MapAccess<'a, R> {
     {
         tri!(self.de.parse_object_colon());
 
-        seed.deserialize(&mut *self.de)
+        let value = seed.deserialize(&mut *self.de);
+        audit::end_value(&mut self.de.audit);
+        value
     }
 }
 
@@ -2216,12 +2304,17 @@ where
     where
         V: de::Visitor<'de>,
     {
+        let audit_mark = self.de.audit_mark();
         self.de.eat_char();
         self.de.scratch.clear();
-        match tri!(self.de.read.parse_str(&mut self.de.scratch)) {
+        let reference = tri!(self.de.read.parse_str(&mut self.de.scratch));
+        audit::note_str(&mut self.de.audit, &reference);
+        let value = match reference {
             Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
             Reference::Copied(s) => visitor.visit_str(s),
-        }
+        };
+        self.de.audit_commit(audit_mark);
+        value
     }
 
     deserialize_numeric_key!(deserialize_i8);

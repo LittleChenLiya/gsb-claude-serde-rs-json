@@ -419,6 +419,7 @@ macro_rules! tri {
 #[macro_use]
 mod macros;
 
+pub mod audit;
 pub mod de;
 pub mod error;
 pub mod map;
